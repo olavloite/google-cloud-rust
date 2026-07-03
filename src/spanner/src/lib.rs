@@ -103,7 +103,7 @@ pub(crate) mod generated;
 
 #[allow(dead_code)]
 #[allow(clippy::all)]
-pub(crate) mod google {
+pub mod google {
     pub mod api {
         include!("generated/protos/spanner/google.api.rs");
     }
@@ -118,3 +118,4 @@ pub(crate) mod google {
         }
     }
 }
+

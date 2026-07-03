@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::database_client::DatabaseClient;
+use crate::client::Spanner;
 use crate::error::internal_error;
 use crate::google::spanner::v1::{self, PartialResultSet};
 use crate::model::ResultSetStats;
@@ -25,6 +26,7 @@ use crate::row::Row;
 use crate::server_streaming::stream::PartialResultSetStream;
 use bytes::Bytes;
 use gaxi::prost::FromProto;
+use prost::Message;
 use google_cloud_gax::backoff_policy::BackoffPolicy;
 use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
 use google_cloud_gax::options::RequestOptions as GaxRequestOptions;
@@ -55,20 +57,28 @@ use futures::Stream;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultSetMode {
+    Rows,
+    Values,
+}
+
 #[derive(Debug)]
 pub struct ResultSet {
+    pub(crate) mode: ResultSetMode,
     stream: Option<PartialResultSetStream>,
-    buffered_values: Vec<prost_types::Value>,
+    pub(crate) buffered_values: Vec<prost_types::Value>,
     chunked: bool,
     seen_last: bool,
-    ready_rows: VecDeque<Row>,
+    pub(crate) ready_rows: VecDeque<Row>,
     local_metadata: Option<ResultSetMetadata>,
     stats: Option<ResultSetStats>,
     precommit_token_tracker: PrecommitTokenTracker,
     tokio_handle: Option<Handle>,
 
     // Fields for retries and buffering of a stream of PartialResultSets.
-    client: DatabaseClient,
+    spanner: Spanner,
+    db_client: Option<DatabaseClient>,
     session_name: String,
     transaction_tag: Option<String>,
     operation: StreamOperation,
@@ -80,19 +90,27 @@ pub struct ResultSet {
     transaction_selector: Option<ReadContextTransactionSelector>,
     channel_hint: usize,
     gax_options: GaxRequestOptions,
+    pub(crate) raw_metadata: Option<crate::google::spanner::v1::ResultSetMetadata>,
+    pub(crate) raw_stats: Option<crate::google::spanner::v1::ResultSetStats>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum StreamOperation {
     Query(crate::model::ExecuteSqlRequest),
     Read(crate::model::ReadRequest),
+    RawQuery {
+        method_path: String,
+        request_bytes: Vec<u8>,
+        decoded: Option<crate::model::ExecuteSqlRequest>,
+    },
 }
 
 pub(crate) struct ResultSetParams {
     pub stream: PartialResultSetStream,
     pub transaction_selector: Option<ReadContextTransactionSelector>,
     pub precommit_token_tracker: PrecommitTokenTracker,
-    pub client: DatabaseClient,
+    pub spanner: Spanner,
+    pub db_client: Option<DatabaseClient>,
     pub session_name: String,
     pub transaction_tag: Option<String>,
     pub operation: StreamOperation,
@@ -119,7 +137,8 @@ impl ResultSet {
             stream,
             transaction_selector,
             precommit_token_tracker,
-            client,
+            spanner,
+            db_client,
             session_name,
             transaction_tag,
             operation,
@@ -130,6 +149,7 @@ impl ResultSet {
         let gax_options = Self::apply_defaults(gax_options);
 
         Self {
+            mode: ResultSetMode::Rows,
             stream: Some(stream),
             buffered_values: Vec::new(),
             chunked: false,
@@ -138,7 +158,8 @@ impl ResultSet {
             local_metadata: None,
             stats: None,
             precommit_token_tracker,
-            client,
+            spanner,
+            db_client,
             session_name,
             transaction_tag,
             operation,
@@ -151,6 +172,8 @@ impl ResultSet {
             channel_hint,
             gax_options,
             tokio_handle: Handle::try_current().ok(),
+            raw_metadata: None,
+            raw_stats: None,
         }
     }
 
@@ -215,6 +238,14 @@ impl ResultSet {
     /// ```
     pub fn metadata(&self) -> Option<&ResultSetMetadata> {
         self.local_metadata.as_ref()
+    }
+
+    pub fn raw_metadata(&self) -> Option<&crate::google::spanner::v1::ResultSetMetadata> {
+        self.raw_metadata.as_ref()
+    }
+
+    pub fn raw_stats(&self) -> Option<&crate::google::spanner::v1::ResultSetStats> {
+        self.raw_stats.as_ref()
     }
 
     /// Returns the stats of the result set, if available.
@@ -333,6 +364,61 @@ impl ResultSet {
         }
     }
 
+    pub(crate) async fn next_values(&mut self) -> Option<crate::Result<Vec<prost_types::Value>>> {
+        loop {
+            if !self.buffered_values.is_empty() {
+                return Some(Ok(std::mem::take(&mut self.buffered_values)));
+            }
+
+            if self.seen_last {
+                if !self.partial_result_sets_buffer.is_empty() {
+                    if let Err(e) = self.flush_buffer() {
+                        return Some(Err(e));
+                    }
+                }
+                if !self.buffered_values.is_empty() {
+                    return Some(Ok(std::mem::take(&mut self.buffered_values)));
+                }
+                if let Some(handle) = &self.tokio_handle
+                    && let Some(s) = self.stream.take()
+                {
+                    drain_stream_in_background(handle, s);
+                }
+                return None;
+            }
+
+            let stream_result = match &mut self.stream {
+                Some(s) => s.next_message().await,
+                None => return None,
+            };
+
+            match stream_result {
+                Some(Ok(partial_result_set)) => {
+                    if let Err(e) = self.handle_partial_result_set(partial_result_set) {
+                        return Some(Err(e));
+                    }
+                }
+                Some(Err(e)) => {
+                    if let Err(err) = self.handle_stream_error(e).await {
+                        return Some(Err(err));
+                    }
+                }
+                None => match self.handle_stream_end() {
+                    Ok(Some(row)) => {
+                        return Some(Ok(row.values.into_iter().map(|v| v.0).collect()));
+                    }
+                    Ok(None) => {
+                        if !self.buffered_values.is_empty() {
+                            return Some(Ok(std::mem::take(&mut self.buffered_values)));
+                        }
+                        return None;
+                    }
+                    Err(e) => return Some(Err(e)),
+                },
+            }
+        }
+    }
+
     /// Converts the [`ResultSet`] into a [`Stream`].
     ///
     /// # Example
@@ -360,6 +446,18 @@ impl ResultSet {
         use futures::stream::unfold;
         Box::pin(unfold(self, |mut result_set| async move {
             result_set.next().await.map(|row| (row, result_set))
+        }))
+    }
+
+
+    pub fn into_values_stream(mut self) -> impl Stream<Item = crate::Result<Vec<prost_types::Value>>> + Unpin {
+        use futures::stream::unfold;
+        self.mode = ResultSetMode::Values;
+        while let Some(row) = self.ready_rows.pop_front() {
+            self.buffered_values.extend(row.values.into_iter().map(|v| v.0));
+        }
+        Box::pin(unfold(self, |mut result_set| async move {
+            result_set.next_values().await.map(|vals| (vals, result_set))
         }))
     }
 }
@@ -436,15 +534,15 @@ impl ResultSet {
         Ok(())
     }
 
-    fn handle_metadata(&mut self, mut m: v1::ResultSetMetadata) -> crate::Result<()> {
-        let transaction = m.transaction.take();
-        let meta = ResultSetMetadata::new(Some(m));
+    fn handle_metadata(&mut self, m: v1::ResultSetMetadata) -> crate::Result<()> {
+        self.raw_metadata = Some(m.clone());
         if let Some(selector) = &self.transaction_selector {
-            if let Some(transaction) = transaction {
+            if let Some(transaction) = &m.transaction {
                 selector.update(
-                    transaction.id,
+                    transaction.id.clone(),
                     transaction
                         .read_timestamp
+                        .clone()
                         .and_then(|t| wkt::Timestamp::new(t.seconds, t.nanos).ok()),
                 )?;
             } else if let ReadContextTransactionSelector::Lazy(lazy) = selector {
@@ -459,6 +557,7 @@ impl ResultSet {
                 }
             }
         }
+        let meta = ResultSetMetadata::new(Some(m));
         self.local_metadata = Some(meta);
         Ok(())
     }
@@ -507,7 +606,7 @@ impl ResultSet {
             .as_ref()
             .unwrap()
             .begin_explicitly(crate::read_only_transaction::ExplicitBeginParams {
-                client: self.client.clone(),
+                client: self.db_client.as_ref().unwrap().clone(),
                 session_name: self.session_name.clone(),
                 transaction_tag: self.transaction_tag.clone(),
                 channel_hint: self.channel_hint,
@@ -567,6 +666,7 @@ impl ResultSet {
                 return Err(internal_error("Additional stats received after first"));
             }
             (None, Some(s)) => {
+                self.raw_stats = Some(s.clone());
                 let converted_stats = s
                     .cnv()
                     .map_err(|e| internal_error(format!("failed to convert stats: {}", e)))?;
@@ -597,6 +697,10 @@ impl ResultSet {
 
         self.buffered_values.extend(values_iter);
         self.chunked = chunked_value;
+
+        if self.mode == ResultSetMode::Values {
+            return Ok(());
+        }
 
         while self.buffered_values.len() >= metadata.column_types.len() {
             let column_count = metadata.column_types.len();
@@ -647,7 +751,6 @@ impl ResultSet {
                     .clone()
                     .or_else(|| req.transaction.take());
                 let stream = self
-                    .client
                     .spanner
                     .execute_streaming_sql(req.clone(), self.gax_options.clone(), self.channel_hint)
                     .send()
@@ -660,9 +763,29 @@ impl ResultSet {
                     .clone()
                     .or_else(|| req.transaction.take());
                 let stream = self
-                    .client
                     .spanner
                     .streaming_read(req.clone(), self.gax_options.clone(), self.channel_hint)
+                    .send()
+                    .await?;
+                self.stream = Some(stream);
+            }
+            StreamOperation::RawQuery { method_path: _method_path, request_bytes, decoded } => {
+                if decoded.is_none() {
+                    let proto_req = crate::google::spanner::v1::ExecuteSqlRequest::decode(&request_bytes[..])
+                        .map_err(|e| crate::error::internal_error(format!("Failed to decode ExecuteSqlRequest on retry: {}", e)))?;
+                    let req: crate::model::ExecuteSqlRequest = proto_req.cnv()
+                        .map_err(|e| crate::error::internal_error(format!("Failed to convert ExecuteSqlRequest on retry: {}", e)))?;
+                    *decoded = Some(req);
+                }
+                let req = decoded.as_mut().unwrap();
+                req.resume_token = self.last_resume_token.clone();
+                req.transaction = transaction_selector
+                    .clone()
+                    .or_else(|| req.transaction.take());
+                
+                let stream = self
+                    .spanner
+                    .execute_streaming_sql(req.clone(), self.gax_options.clone(), self.channel_hint)
                     .send()
                     .await?;
                 self.stream = Some(stream);

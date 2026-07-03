@@ -239,6 +239,23 @@ impl List {
         self.0.values.iter().map(Value::from_ref)
     }
 }
+impl From<prost_types::Value> for Value {
+    fn from(v: prost_types::Value) -> Self {
+        Self(v)
+    }
+}
+
+impl From<prost_types::Struct> for Struct {
+    fn from(s: prost_types::Struct) -> Self {
+        Self(s)
+    }
+}
+
+impl From<prost_types::ListValue> for List {
+    fn from(l: prost_types::ListValue) -> Self {
+        Self(l)
+    }
+}
 
 #[cfg(test)]
 mod tests {

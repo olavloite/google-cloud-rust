@@ -518,7 +518,11 @@ impl Client {
         } else {
             endpoint
         };
-        let mut endpoint = endpoint.origin(origin).concurrency_limit(100);
+        let mut endpoint = endpoint
+            .origin(origin)
+            .concurrency_limit(100)
+            .initial_stream_window_size(Some(4 * 1024 * 1024))
+            .initial_connection_window_size(Some(4 * 1024 * 1024));
         if let Some(limit) = grpc_max_header_list_size {
             endpoint = endpoint.http2_max_header_list_size(limit);
         }

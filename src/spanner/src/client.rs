@@ -366,6 +366,182 @@ impl Spanner {
             .with_request(request)
             .with_options(options)
     }
+
+    fn resolve_path_uri(path: &str) -> crate::Result<http::uri::PathAndQuery> {
+        match path {
+            "/google.spanner.v1.Spanner/ExecuteStreamingSql" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/ExecuteStreamingSql")),
+            "/google.spanner.v1.Spanner/ExecuteSql" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/ExecuteSql")),
+            "/google.spanner.v1.Spanner/Commit" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/Commit")),
+            "/google.spanner.v1.Spanner/Rollback" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/Rollback")),
+            "/google.spanner.v1.Spanner/BeginTransaction" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/BeginTransaction")),
+            "/google.spanner.v1.Spanner/CreateSession" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/CreateSession")),
+            "/google.spanner.v1.Spanner/DeleteSession" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/DeleteSession")),
+            "/google.spanner.v1.Spanner/BatchCreateSessions" => Ok(http::uri::PathAndQuery::from_static("/google.spanner.v1.Spanner/BatchCreateSessions")),
+            _ => path.parse().map_err(google_cloud_gax::error::Error::binding),
+        }
+    }
+
+    pub async fn make_unary_call(
+        &self,
+        path: &str,
+        request_bytes: Vec<u8>,
+        options: crate::RequestOptions,
+        channel_hint: usize,
+    ) -> crate::Result<Vec<u8>> {
+        let channel = self.get_channel(channel_hint);
+        let grpc_client = channel
+            .grpc_client
+            .as_ref()
+            .expect("GRPC client is not available");
+
+        let path_uri = Self::resolve_path_uri(path)?;
+
+        let request = PassthroughBytes(request_bytes);
+
+        let response = grpc_client
+            .execute::<PassthroughBytes, PassthroughBytes>(
+                gaxi::grpc::tonic::Extensions::new(),
+                path_uri,
+                request,
+                options,
+                "gl-rust/0.1.0",
+                "",
+            )
+            .await?;
+
+        Ok(response.into_inner().0)
+    }
+
+    pub async fn make_streaming_call(
+        &self,
+        path: &str,
+        request_bytes: Vec<u8>,
+        options: crate::RequestOptions,
+        channel_hint: usize,
+    ) -> crate::Result<gaxi::grpc::tonic::Streaming<PassthroughBytes>> {
+        let channel = self.get_channel(channel_hint);
+        let grpc_client = channel
+            .grpc_client
+            .as_ref()
+            .expect("GRPC client is not available");
+
+        let path_uri = Self::resolve_path_uri(path)?;
+
+        let request = PassthroughBytes(request_bytes);
+
+        let response = grpc_client
+            .server_streaming::<PassthroughBytes, PassthroughBytes>(
+                gaxi::grpc::tonic::Extensions::new(),
+                path_uri,
+                request,
+                options,
+                "gl-rust/0.1.0",
+                "",
+            )
+            .await?;
+
+        Ok(response.into_inner())
+    }
+
+    pub async fn execute_sql_bytes(
+        &self,
+        request_bytes: Vec<u8>,
+        options: Option<crate::RequestOptions>,
+        channel_hint: usize,
+    ) -> crate::Result<crate::result_set::ResultSet> {
+        let gax_options = options.unwrap_or_default().clone();
+        
+        let channel = self.get_channel(channel_hint);
+        let grpc_client = channel
+            .grpc_client
+            .as_ref()
+            .expect("GRPC client is not available");
+
+        let path_uri: http::uri::PathAndQuery = "/google.spanner.v1.Spanner/ExecuteStreamingSql".parse().unwrap();
+        let request = PassthroughBytes(request_bytes.clone());
+
+        let response = grpc_client
+            .server_streaming::<PassthroughBytes, crate::google::spanner::v1::PartialResultSet>(
+                gaxi::grpc::tonic::Extensions::new(),
+                path_uri,
+                request,
+                gax_options.clone(),
+                "gl-rust/0.1.0",
+                "",
+            )
+            .await?;
+
+        let stream = crate::server_streaming::stream::PartialResultSetStream::new(response.into_inner());
+
+        crate::result_set::ResultSet::create(crate::result_set::ResultSetParams {
+            stream,
+            transaction_selector: None,
+            precommit_token_tracker: crate::precommit::PrecommitTokenTracker::new_noop(),
+            spanner: self.clone(),
+            db_client: None,
+            session_name: String::new(),
+            transaction_tag: None,
+            operation: crate::result_set::StreamOperation::RawQuery {
+                method_path: "/google.spanner.v1.Spanner/ExecuteStreamingSql".to_string(),
+                request_bytes,
+                decoded: None,
+            },
+            channel_hint: 0,
+            gax_options,
+        })
+        .await
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PassthroughBytes(pub Vec<u8>);
+
+impl prost::Message for PassthroughBytes {
+    fn encode_raw(&self, buf: &mut impl prost::bytes::BufMut)
+    {
+        buf.put_slice(&self.0);
+    }
+
+    fn merge_field(
+        &mut self,
+        _tag: u32,
+        _wire_type: prost::encoding::WireType,
+        buf: &mut impl prost::bytes::Buf,
+        _ctx: prost::encoding::DecodeContext,
+    ) -> std::result::Result<(), prost::DecodeError>
+    {
+        let len = buf.remaining();
+        self.0.reserve(len);
+        while buf.has_remaining() {
+            let chunk = buf.chunk();
+            self.0.extend_from_slice(chunk);
+            let chunk_len = chunk.len();
+            buf.advance(chunk_len);
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, mut buf: impl prost::bytes::Buf) -> std::result::Result<(), prost::DecodeError>
+    {
+        let len = buf.remaining();
+        self.0.clear();
+        self.0.reserve(len);
+        while buf.has_remaining() {
+            let chunk = buf.chunk();
+            self.0.extend_from_slice(chunk);
+            let chunk_len = chunk.len();
+            buf.advance(chunk_len);
+        }
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 #[derive(Clone, Debug)]
